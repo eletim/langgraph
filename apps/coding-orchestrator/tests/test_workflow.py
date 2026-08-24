@@ -1,6 +1,13 @@
 from __future__ import annotations
 
-from coding_orchestrator.client import FakeTerminalSessionClient, FakeTurn
+import pytest
+
+from coding_orchestrator.client import (
+    FakeTerminalSessionClient,
+    FakeTurn,
+    MulmoTerminalHTTPClient,
+    WorkerFailure,
+)
 from coding_orchestrator.workflow import CodingWorkflow, CodingWorkflowConfig
 
 
@@ -105,3 +112,14 @@ def test_worker_failure_fails_workflow() -> None:
 
     assert result["final_status"] == "FAILED"
     assert "codex turn failed" in result["error"]
+
+
+def test_http_client_treats_turn_failure_as_worker_failure() -> None:
+    client = MulmoTerminalHTTPClient("http://terminal.local", poll_interval_seconds=0)
+    client._get_session = lambda session_id: {  # type: ignore[method-assign]
+        "status": "idle",
+        "turn_status": "failed",
+    }
+
+    with pytest.raises(WorkerFailure, match="turn entered failed"):
+        client.wait_for_turn_completion("session-1", timeout_seconds=1)

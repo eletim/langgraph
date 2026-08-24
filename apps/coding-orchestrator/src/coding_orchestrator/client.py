@@ -184,6 +184,8 @@ class MulmoTerminalHTTPClient:
             turn_status = str(data.get("turn_status") or "").lower()
             if status in {"failed", "error", "stopped", "exited"}:
                 raise WorkerFailure(f"session {session_id} entered {status}")
+            if turn_status in {"failed", "error"}:
+                raise WorkerFailure(f"session {session_id} turn entered {turn_status}")
             if turn_status in {"running", "busy"} or status in {"running", "busy"}:
                 saw_busy = True
             if turn_status in {"complete", "completed", "done"}:
