@@ -29,6 +29,23 @@ PurpleMux runtime state and structured results are authoritative. The workflow d
 not inspect tmux or parse terminal captures. `capture_screen()` exists only as an
 explicit diagnostic operation and is not part of `TerminalSessionClient`.
 
+The production runtime path is:
+
+```text
+LangGraph workflow
+  -> PurpleMuxCLIClient
+  -> PurpleMux CLI
+  -> shared PurpleMux runtime
+  -> provider / StatusManager / timeline
+  -> tmux
+  -> Codex / Claude
+```
+
+The client uses the public `tab create`, `tab status`, `tab send`, `tab result`,
+`tab interrupt`, and `tab close` operations. `tab capture` is diagnostic-only. It
+does not call tmux directly, access private APIs or `~/.purplemux` internal files,
+parse pane output, or independently infer agent state.
+
 `status` and `result` are read-only and retry once after a subprocess timeout by
 default. `create`, `send`, `interrupt`, and `close` are never retried automatically:
 a timeout raises `MutationOutcomeUnknown`, because the operation may already have
@@ -62,8 +79,7 @@ new interrupt for that turn. `pre-e2e` additionally creates the Claude reviewer 
 verifies that it is ready, but does not send review input without the implementer
 structured result.
 
-Once PurpleMux structured result discovery is working, run the full workflow without
-changing or mocking the client:
+Run the production B/C workflow, including Codex and Claude structured results, with:
 
 ```bash
 make live-smoke ARGS="full-e2e --workspace ws-example \
