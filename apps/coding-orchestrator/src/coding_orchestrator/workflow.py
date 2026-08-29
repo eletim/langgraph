@@ -35,6 +35,20 @@ class CodingWorkflowState(TypedDict, total=False):
     implementer_output: str
     final_status: FinalStatus
     error: str
+    cleanup_error: str
+    unclean_session_ids: list[str]
+
+
+class _SessionStartupCleanupFailure(TerminalSessionError):
+    def __init__(
+        self,
+        session_id: str,
+        ready_error: TerminalSessionError,
+        cleanup_error: TerminalSessionError,
+    ) -> None:
+        super().__init__(str(ready_error))
+        self.session_id = session_id
+        self.cleanup_error = cleanup_error
 
 
 @dataclass(frozen=True)
@@ -64,7 +78,26 @@ class CodingWorkflow:
             "task": task,
             "review_count": 0,
         }
-        return self.graph.invoke(initial_state)
+        result = cast(CodingWorkflowState, self.graph.invoke(initial_state))
+        cleanup_errors: list[str] = []
+        unclean_session_ids = set(result.get("unclean_session_ids", []))
+        for key in ("implementer_session_id", "reviewer_session_id"):
+            session_id = result.get(key)
+            if not session_id or session_id in unclean_session_ids:
+                continue
+            try:
+                self.terminal_client.close_session(session_id)
+            except TerminalSessionError as exc:
+                cleanup_errors.append(f"{session_id}: {exc}")
+                unclean_session_ids.add(session_id)
+        if cleanup_errors:
+            previous_error = result.get("cleanup_error")
+            if previous_error:
+                cleanup_errors.insert(0, previous_error)
+            result["cleanup_error"] = "; ".join(cleanup_errors)
+        if unclean_session_ids:
+            result["unclean_session_ids"] = sorted(unclean_session_ids)
+        return result
 
     def _build_graph(self) -> Any:
         builder = StateGraph(cast(Any, CodingWorkflowState))
@@ -93,8 +126,8 @@ class CodingWorkflow:
         return builder.compile()
 
     def _implement(self, state: CodingWorkflowState) -> CodingWorkflowState:
+        session_id = state.get("implementer_session_id")
         try:
-            session_id = state.get("implementer_session_id")
             if not session_id:
                 session_id = self._create_and_wait(
                     worker=self.config.implementer_worker,
@@ -108,11 +141,18 @@ class CodingWorkflow:
                 "implementer_output": output,
             }
         except TerminalSessionError as exc:
-            return self._terminal_failure(exc)
+            failure = self._terminal_failure(exc)
+            if isinstance(exc, _SessionStartupCleanupFailure):
+                session_id = exc.session_id
+                failure["cleanup_error"] = f"{session_id}: {exc.cleanup_error}"
+                failure["unclean_session_ids"] = [session_id]
+            if session_id:
+                failure["implementer_session_id"] = session_id
+            return failure
 
     def _review(self, state: CodingWorkflowState) -> CodingWorkflowState:
+        session_id = state.get("reviewer_session_id")
         try:
-            session_id = state.get("reviewer_session_id")
             if not session_id:
                 session_id = self._create_and_wait(
                     worker=self.config.reviewer_worker,
@@ -133,7 +173,14 @@ class CodingWorkflow:
                 update["final_status"] = "APPROVED"
             return update
         except TerminalSessionError as exc:
-            return self._terminal_failure(exc)
+            failure = self._terminal_failure(exc)
+            if isinstance(exc, _SessionStartupCleanupFailure):
+                session_id = exc.session_id
+                failure["cleanup_error"] = f"{session_id}: {exc.cleanup_error}"
+                failure["unclean_session_ids"] = [session_id]
+            if session_id:
+                failure["reviewer_session_id"] = session_id
+            return failure
 
     def _fix(self, state: CodingWorkflowState) -> CodingWorkflowState:
         try:
@@ -162,9 +209,18 @@ class CodingWorkflow:
                 metadata={"role": role},
             )
         )
-        self.terminal_client.wait_until_ready(
-            session_id, self.config.ready_timeout_seconds
-        )
+        try:
+            self.terminal_client.wait_until_ready(
+                session_id, self.config.ready_timeout_seconds
+            )
+        except TerminalSessionError as ready_error:
+            try:
+                self.terminal_client.close_session(session_id)
+            except TerminalSessionError as cleanup_error:
+                raise _SessionStartupCleanupFailure(
+                    session_id, ready_error, cleanup_error
+                ) from ready_error
+            raise
         return session_id
 
     def _send_turn(self, session_id: str, prompt: str) -> str:
@@ -172,7 +228,7 @@ class CodingWorkflow:
         self.terminal_client.wait_for_turn_completion(
             session_id, self.config.turn_timeout_seconds
         )
-        return self.terminal_client.read_screen(session_id)
+        return self.terminal_client.read_result(session_id)
 
     def _route_worker_step(
         self, state: CodingWorkflowState

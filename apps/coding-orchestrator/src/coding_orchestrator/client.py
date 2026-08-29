@@ -23,6 +23,22 @@ class WorkerFailure(TerminalSessionError):
     """Raised when a terminal-backed worker fails."""
 
 
+class WorkerNeedsInput(WorkerFailure):
+    """Raised when a worker cannot complete without additional input."""
+
+
+class WorkerInterrupted(WorkerFailure):
+    """Raised when a worker turn is interrupted."""
+
+
+class ResultNotReady(WorkerFailure):
+    """Raised when a structured worker result is not ready."""
+
+
+class MutationOutcomeUnknown(WorkerFailure):
+    """Raised when a timed-out mutation may have been applied remotely."""
+
+
 @dataclass(frozen=True)
 class CreateSessionRequest:
     worker: str
@@ -44,8 +60,14 @@ class TerminalSessionClient(Protocol):
     def wait_for_turn_completion(self, session_id: str, timeout_seconds: float) -> None:
         """Wait until the current worker turn has completed."""
 
-    def read_screen(self, session_id: str) -> str:
-        """Read the current terminal screen or captured turn output."""
+    def read_result(self, session_id: str) -> str:
+        """Read the latest completed structured worker result."""
+
+    def interrupt(self, session_id: str) -> None:
+        """Interrupt the current worker turn."""
+
+    def close_session(self, session_id: str) -> None:
+        """Close the terminal session."""
 
 
 @dataclass(frozen=True)
@@ -63,6 +85,7 @@ class FakeTerminalSessionClient:
         *,
         ready_timeout_workers: set[str] | None = None,
         create_failure_workers: set[str] | None = None,
+        close_failure_workers: set[str] | None = None,
     ) -> None:
         self._scripts = {
             worker: deque(
@@ -72,12 +95,14 @@ class FakeTerminalSessionClient:
         }
         self._ready_timeout_workers = ready_timeout_workers or set()
         self._create_failure_workers = create_failure_workers or set()
+        self._close_failure_workers = close_failure_workers or set()
         self._session_workers: dict[str, str] = {}
-        self._screens: dict[str, str] = {}
+        self._results: dict[str, str] = {}
         self._pending_input: dict[str, str] = {}
         self._counts: defaultdict[str, int] = defaultdict(int)
         self.inputs: list[tuple[str, str, str]] = []
         self.created_sessions: list[tuple[str, CreateSessionRequest]] = []
+        self.closed_sessions: list[str] = []
 
     def create_session(self, request: CreateSessionRequest) -> str:
         if request.worker in self._create_failure_workers:
@@ -85,7 +110,7 @@ class FakeTerminalSessionClient:
         self._counts[request.worker] += 1
         session_id = f"{request.worker}-{self._counts[request.worker]}"
         self._session_workers[session_id] = request.worker
-        self._screens[session_id] = ""
+        self._results[session_id] = ""
         self.created_sessions.append((session_id, request))
         return session_id
 
@@ -111,11 +136,24 @@ class FakeTerminalSessionClient:
         turn = self._scripts[worker].popleft()
         if turn.fail:
             raise WorkerFailure(f"{worker} turn failed")
-        self._screens[session_id] = turn.output
+        self._results[session_id] = turn.output
 
-    def read_screen(self, session_id: str) -> str:
+    def read_result(self, session_id: str) -> str:
         self._worker_for(session_id)
-        return self._screens[session_id]
+        return self._results[session_id]
+
+    def interrupt(self, session_id: str) -> None:
+        self._worker_for(session_id)
+        self._pending_input.pop(session_id, None)
+
+    def close_session(self, session_id: str) -> None:
+        worker = self._worker_for(session_id)
+        if worker in self._close_failure_workers:
+            raise WorkerFailure(f"{worker} session {session_id} close failed")
+        self.closed_sessions.append(session_id)
+        del self._session_workers[session_id]
+        self._pending_input.pop(session_id, None)
+        self._results.pop(session_id, None)
 
     def _worker_for(self, session_id: str) -> str:
         try:
@@ -125,7 +163,7 @@ class FakeTerminalSessionClient:
 
 
 class MulmoTerminalHTTPClient:
-    """HTTP implementation for the planned MulmoTerminal Session API."""
+    """Deprecated HTTP implementation for the planned MulmoTerminal Session API."""
 
     def __init__(
         self,
@@ -197,7 +235,7 @@ class MulmoTerminalHTTPClient:
             f"session {session_id} did not complete a turn within {timeout_seconds}s"
         )
 
-    def read_screen(self, session_id: str) -> str:
+    def read_result(self, session_id: str) -> str:
         data = self._request_json(
             "GET", f"/api/sessions/{quote(session_id, safe='')}/screen"
         )
@@ -206,6 +244,14 @@ class MulmoTerminalHTTPClient:
             if isinstance(value, str):
                 return value
         return json.dumps(data, ensure_ascii=False)
+
+    def interrupt(self, session_id: str) -> None:
+        self._request_json(
+            "POST", f"/api/sessions/{quote(session_id, safe='')}/interrupt"
+        )
+
+    def close_session(self, session_id: str) -> None:
+        self._request_json("DELETE", f"/api/sessions/{quote(session_id, safe='')}")
 
     def _get_session(self, session_id: str) -> dict[str, Any]:
         return self._request_json("GET", f"/api/sessions/{quote(session_id, safe='')}")

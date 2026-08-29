@@ -3,11 +3,16 @@ from coding_orchestrator.client import (
     FakeTerminalSessionClient,
     FakeTurn,
     MulmoTerminalHTTPClient,
+    MutationOutcomeUnknown,
+    ResultNotReady,
     SessionReadyTimeout,
     TerminalSessionClient,
     TerminalSessionError,
     WorkerFailure,
+    WorkerInterrupted,
+    WorkerNeedsInput,
 )
+from coding_orchestrator.purplemux import PurpleMuxCLIClient
 from coding_orchestrator.workflow import (
     CodingWorkflow,
     CodingWorkflowConfig,
@@ -21,9 +26,14 @@ __all__ = [
     "CreateSessionRequest",
     "FakeTerminalSessionClient",
     "FakeTurn",
+    "MutationOutcomeUnknown",
     "MulmoTerminalHTTPClient",
+    "PurpleMuxCLIClient",
+    "ResultNotReady",
     "SessionReadyTimeout",
     "TerminalSessionClient",
     "TerminalSessionError",
     "WorkerFailure",
+    "WorkerInterrupted",
+    "WorkerNeedsInput",
 ]
