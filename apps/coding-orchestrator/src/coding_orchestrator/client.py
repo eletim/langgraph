@@ -74,6 +74,7 @@ class TerminalSessionClient(Protocol):
 class FakeTurn:
     output: str = ""
     fail: bool = False
+    error: TerminalSessionError | None = None
 
 
 class FakeTerminalSessionClient:
@@ -134,6 +135,8 @@ class FakeTerminalSessionClient:
         if not self._scripts.get(worker):
             raise WorkerFailure(f"{worker} script has no remaining turns")
         turn = self._scripts[worker].popleft()
+        if turn.error is not None:
+            raise turn.error
         if turn.fail:
             raise WorkerFailure(f"{worker} turn failed")
         self._results[session_id] = turn.output

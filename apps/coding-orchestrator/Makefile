@@ -1,4 +1,4 @@
-.PHONY: all format lint type test smoke
+.PHONY: all format lint type test smoke live-smoke
 
 all: help
 
@@ -29,8 +29,12 @@ format:
 smoke:
 	uv run python -m coding_orchestrator.smoke
 
+live-smoke:
+	uv run python -m coding_orchestrator.live_smoke $(ARGS)
+
 help:
 	@echo 'format - run code formatters'
 	@echo 'lint   - run linters and type checking'
 	@echo 'test   - run tests'
 	@echo 'smoke  - run a fake-client workflow smoke check'
+	@echo 'live-smoke - run a PurpleMux lifecycle/E2E smoke check (set ARGS)'

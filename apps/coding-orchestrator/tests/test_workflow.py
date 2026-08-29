@@ -7,6 +7,8 @@ from coding_orchestrator.client import (
     FakeTurn,
     MulmoTerminalHTTPClient,
     WorkerFailure,
+    WorkerInterrupted,
+    WorkerNeedsInput,
 )
 from coding_orchestrator.workflow import CodingWorkflow, CodingWorkflowConfig
 
@@ -135,6 +137,59 @@ def test_worker_failure_fails_workflow() -> None:
     assert client.closed_sessions == ["codex-1"]
 
 
+def test_implementer_needs_input_fails_without_polling_forever() -> None:
+    client = FakeTerminalSessionClient(
+        {"codex": [FakeTurn(error=WorkerNeedsInput("codex needs input"))]}
+    )
+
+    result = run_workflow(client)
+
+    assert result["final_status"] == "FAILED"
+    assert result["error"] == "codex needs input"
+    assert client.closed_sessions == ["codex-1"]
+    assert not any(worker == "claude-code" for _, worker, _ in client.inputs)
+
+
+def test_reviewer_interrupt_fails_and_cleans_up_both_sessions() -> None:
+    client = FakeTerminalSessionClient(
+        {
+            "codex": ["implementation complete"],
+            "claude-code": [FakeTurn(error=WorkerInterrupted("reviewer interrupted"))],
+        }
+    )
+
+    result = run_workflow(client)
+
+    assert result["final_status"] == "FAILED"
+    assert result["error"] == "reviewer interrupted"
+    assert client.closed_sessions == ["codex-1", "claude-code-1"]
+
+
+def test_unexpected_exception_cleans_up_all_created_sessions() -> None:
+    class UnexpectedReviewerResultClient(FakeTerminalSessionClient):
+        def __init__(self) -> None:
+            super().__init__(
+                {
+                    "codex": ["implementation complete"],
+                    "claude-code": ["DECISION: APPROVED"],
+                }
+            )
+            self.result_reads = 0
+
+        def read_result(self, session_id: str) -> str:
+            self.result_reads += 1
+            if self.result_reads == 2:
+                raise ValueError("unexpected reviewer result failure")
+            return super().read_result(session_id)
+
+    client = UnexpectedReviewerResultClient()
+
+    with pytest.raises(ValueError, match="unexpected reviewer result failure"):
+        run_workflow(client)
+
+    assert client.closed_sessions == ["codex-1", "claude-code-1"]
+
+
 def test_cleanup_failure_is_reported_without_overwriting_workflow_result() -> None:
     client = FakeTerminalSessionClient(
         {
@@ -150,6 +205,23 @@ def test_cleanup_failure_is_reported_without_overwriting_workflow_result() -> No
     assert "claude-code-1 close failed" in result["cleanup_error"]
     assert result["unclean_session_ids"] == ["claude-code-1"]
     assert client.closed_sessions == ["codex-1"]
+
+
+def test_one_cleanup_failure_does_not_stop_the_other_cleanup() -> None:
+    client = FakeTerminalSessionClient(
+        {
+            "codex": ["implementation complete"],
+            "claude-code": ["DECISION: APPROVED"],
+        },
+        close_failure_workers={"codex"},
+    )
+
+    result = run_workflow(client)
+
+    assert result["final_status"] == "APPROVED"
+    assert "codex-1 close failed" in result["cleanup_error"]
+    assert result["unclean_session_ids"] == ["codex-1"]
+    assert client.closed_sessions == ["claude-code-1"]
 
 
 def test_http_client_treats_turn_failure_as_worker_failure() -> None:

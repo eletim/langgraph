@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, Literal, cast
 
@@ -22,6 +23,9 @@ ReviewResult = Literal["APPROVED", "CHANGES_REQUESTED"]
 FinalStatus = Literal["APPROVED", "FAILED"]
 
 _DECISION_RE = re.compile(r"^\s*(?:DECISION:\s*)?(APPROVED|CHANGES_REQUESTED)\s*$")
+_ACTIVE_SESSION_IDS: ContextVar[list[str] | None] = ContextVar(
+    "coding_workflow_active_session_ids", default=None
+)
 
 
 class CodingWorkflowState(TypedDict, total=False):
@@ -78,26 +82,50 @@ class CodingWorkflow:
             "task": task,
             "review_count": 0,
         }
-        result = cast(CodingWorkflowState, self.graph.invoke(initial_state))
+        active_session_ids: list[str] = []
+        token = _ACTIVE_SESSION_IDS.set(active_session_ids)
+        try:
+            try:
+                result = cast(CodingWorkflowState, self.graph.invoke(initial_state))
+            except BaseException as workflow_error:
+                cleanup_errors, _ = self._cleanup_sessions(active_session_ids, set())
+                if cleanup_errors:
+                    raise TerminalSessionError(
+                        f"workflow raised {workflow_error!r}; cleanup failed: "
+                        f"{'; '.join(cleanup_errors)}"
+                    ) from workflow_error
+                raise
+
+            unclean_session_ids = set(result.get("unclean_session_ids", []))
+            cleanup_errors, newly_unclean = self._cleanup_sessions(
+                active_session_ids, unclean_session_ids
+            )
+            unclean_session_ids.update(newly_unclean)
+            if cleanup_errors:
+                previous_error = result.get("cleanup_error")
+                if previous_error:
+                    cleanup_errors.insert(0, previous_error)
+                result["cleanup_error"] = "; ".join(cleanup_errors)
+            if unclean_session_ids:
+                result["unclean_session_ids"] = sorted(unclean_session_ids)
+            return result
+        finally:
+            _ACTIVE_SESSION_IDS.reset(token)
+
+    def _cleanup_sessions(
+        self, session_ids: list[str], skip: set[str]
+    ) -> tuple[list[str], set[str]]:
         cleanup_errors: list[str] = []
-        unclean_session_ids = set(result.get("unclean_session_ids", []))
-        for key in ("implementer_session_id", "reviewer_session_id"):
-            session_id = result.get(key)
-            if not session_id or session_id in unclean_session_ids:
+        unclean_session_ids: set[str] = set()
+        for session_id in dict.fromkeys(session_ids):
+            if session_id in skip:
                 continue
             try:
                 self.terminal_client.close_session(session_id)
             except TerminalSessionError as exc:
                 cleanup_errors.append(f"{session_id}: {exc}")
                 unclean_session_ids.add(session_id)
-        if cleanup_errors:
-            previous_error = result.get("cleanup_error")
-            if previous_error:
-                cleanup_errors.insert(0, previous_error)
-            result["cleanup_error"] = "; ".join(cleanup_errors)
-        if unclean_session_ids:
-            result["unclean_session_ids"] = sorted(unclean_session_ids)
-        return result
+        return cleanup_errors, unclean_session_ids
 
     def _build_graph(self) -> Any:
         builder = StateGraph(cast(Any, CodingWorkflowState))
@@ -209,6 +237,9 @@ class CodingWorkflow:
                 metadata={"role": role},
             )
         )
+        active_session_ids = _ACTIVE_SESSION_IDS.get()
+        if active_session_ids is not None:
+            active_session_ids.append(session_id)
         try:
             self.terminal_client.wait_until_ready(
                 session_id, self.config.ready_timeout_seconds
@@ -216,6 +247,8 @@ class CodingWorkflow:
         except TerminalSessionError as ready_error:
             try:
                 self.terminal_client.close_session(session_id)
+                if active_session_ids is not None:
+                    active_session_ids.remove(session_id)
             except TerminalSessionError as cleanup_error:
                 raise _SessionStartupCleanupFailure(
                     session_id, ready_error, cleanup_error
