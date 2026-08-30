@@ -1,0 +1,50 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "coding-orchestrator"
+version = "0.1.0"
+description = "B/C coding agent orchestration workflow built on LangGraph."
+authors = []
+requires-python = ">=3.10"
+readme = "README.md"
+license = "MIT"
+dependencies = [
+    "langgraph",
+    "typing-extensions>=4.0.0",
+]
+
+[dependency-groups]
+test = [
+    "pytest",
+]
+lint = [
+    "ruff",
+    "ty",
+]
+dev = [
+    {include-group = "test"},
+    {include-group = "lint"},
+]
+
+[tool.uv.sources]
+langgraph = { path = "../../libs/langgraph", editable = true }
+langgraph-checkpoint = { path = "../../libs/checkpoint", editable = true }
+langgraph-prebuilt = { path = "../../libs/prebuilt", editable = true }
+langgraph-sdk = { path = "../../libs/sdk-py", editable = true }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/coding_orchestrator"]
+
+[tool.ruff]
+lint.select = ["E", "F", "I", "RUF100", "UP"]
+lint.ignore = ["E501"]
+line-length = 88
+target-version = "py310"
+
+[tool.ty.rules]
+unresolved-import = "ignore"
+
+[tool.pytest.ini_options]
+addopts = "--strict-markers --strict-config --durations=5 -vv"
