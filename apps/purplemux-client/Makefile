@@ -1,4 +1,4 @@
-.PHONY: all format lint typecheck test live-smoke
+.PHONY: all format lint typecheck test live-smoke web
 
 all: help
 
@@ -29,9 +29,13 @@ format:
 live-smoke:
 	uv run python -m purplemux_client.live_smoke $(ARGS)
 
+web:
+	uv run python -m purplemux_client.web $(ARGS)
+
 help:
 	@echo 'format     - run code formatters'
 	@echo 'lint       - run linters and type checking'
 	@echo 'typecheck  - run static type checking'
 	@echo 'test       - run tests'
 	@echo 'live-smoke - run a live PurpleMux adapter lifecycle check (set ARGS)'
+	@echo 'web        - run the trusted local Python Runner UI (set ARGS)'
