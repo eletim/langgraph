@@ -303,6 +303,213 @@ def test_fresh_result_handles_short_turn_when_busy_event_is_missed() -> None:
     assert cli.read_result("tab-1") == "fast"
 
 
+def test_idle_accepts_fresh_completion_after_ready_state_is_dismissed() -> None:
+    runner = FakeRunner(
+        [
+            *baseline(),
+            completed({"status": "sent"}),
+            completed({"cliState": "busy", "alive": True, "eventSeq": 2}),
+            completed(
+                {
+                    "cliState": "idle",
+                    "alive": True,
+                    "eventSeq": 3,
+                    "readyForReviewAt": None,
+                    "dismissedAt": 300,
+                    "lastEvent": {"name": "stop", "seq": 3},
+                }
+            ),
+            completed(
+                {
+                    "status": "completed",
+                    "text": "dismissed",
+                    "completionTimestamp": 2,
+                }
+            ),
+        ]
+    )
+    cli = client(runner)
+
+    cli.send_input("tab-1", "work")
+    cli.wait_for_turn_completion("tab-1", 1)
+
+    assert cli.read_result("tab-1") == "dismissed"
+
+
+def test_idle_accepts_fresh_completion_when_busy_poll_is_missed() -> None:
+    runner = FakeRunner(
+        [
+            *baseline(),
+            completed({"status": "sent"}),
+            completed(
+                {
+                    "cliState": "idle",
+                    "alive": True,
+                    "eventSeq": 3,
+                    "readyForReviewAt": None,
+                    "lastEvent": {"name": "stop", "seq": 3},
+                }
+            ),
+            completed(
+                {
+                    "status": "completed",
+                    "text": "fast dismissed",
+                    "completionTimestamp": 2,
+                }
+            ),
+        ]
+    )
+    cli = client(runner)
+
+    cli.send_input("tab-1", "work")
+    cli.wait_for_turn_completion("tab-1", 1)
+
+    assert cli.read_result("tab-1") == "fast dismissed"
+
+
+def test_send_rejects_unavailable_baseline_event_sequence() -> None:
+    runner = FakeRunner(
+        [
+            completed({"cliState": "idle", "alive": True}),
+        ]
+    )
+    cli = client(runner)
+
+    with pytest.raises(WorkerFailure, match="no event sequence"):
+        cli.send_input("tab-1", "work")
+
+    assert [call[2] for call in runner.calls] == ["status"]
+
+
+def test_idle_rejects_stale_stop_event_and_result() -> None:
+    runner = FakeRunner(
+        [
+            *baseline(
+                event_seq=3,
+                result_status="completed",
+                text="old",
+                completion_timestamp=10,
+            ),
+            completed({"status": "sent"}),
+            completed(
+                {
+                    "cliState": "idle",
+                    "alive": True,
+                    "eventSeq": 3,
+                    "readyForReviewAt": None,
+                    "lastEvent": {"name": "stop", "seq": 3},
+                }
+            ),
+        ]
+    )
+    cli = client(runner)
+
+    cli.send_input("tab-1", "work")
+    with pytest.raises(WorkerFailure, match="did not complete"):
+        cli.wait_for_turn_completion("tab-1", 0)
+
+    assert [call[2] for call in runner.calls] == ["status", "result", "send", "status"]
+
+
+def test_idle_uses_baseline_last_event_sequence_to_reject_stale_stop() -> None:
+    runner = FakeRunner(
+        [
+            completed(
+                {
+                    "cliState": "idle",
+                    "alive": True,
+                    "lastEvent": {"name": "stop", "seq": 3},
+                }
+            ),
+            completed(
+                {
+                    "status": "completed",
+                    "text": "old",
+                    "completionTimestamp": 10,
+                }
+            ),
+            completed({"status": "sent"}),
+            completed(
+                {
+                    "cliState": "idle",
+                    "alive": True,
+                    "readyForReviewAt": None,
+                    "lastEvent": {"name": "stop", "seq": 3},
+                }
+            ),
+        ]
+    )
+    cli = client(runner)
+
+    cli.send_input("tab-1", "work")
+    with pytest.raises(WorkerFailure, match="did not complete"):
+        cli.wait_for_turn_completion("tab-1", 0)
+
+    assert [call[2] for call in runner.calls] == ["status", "result", "send", "status"]
+
+
+def test_idle_waits_for_completed_result_after_fresh_stop_event() -> None:
+    stopped = {
+        "cliState": "idle",
+        "alive": True,
+        "eventSeq": 3,
+        "readyForReviewAt": None,
+        "lastEvent": {"name": "stop", "seq": 3},
+    }
+    runner = FakeRunner(
+        [
+            *baseline(),
+            completed({"status": "sent"}),
+            completed(stopped),
+            completed({"status": "not-ready", "completionTimestamp": None}),
+            completed(stopped),
+            completed(
+                {
+                    "status": "completed",
+                    "text": "published",
+                    "completionTimestamp": 2,
+                }
+            ),
+        ]
+    )
+    cli = client(runner)
+
+    cli.send_input("tab-1", "work")
+    cli.wait_for_turn_completion("tab-1", 1)
+
+    assert cli.read_result("tab-1") == "published"
+
+
+def test_idle_fresh_stop_with_interrupted_result_is_explicit() -> None:
+    runner = FakeRunner(
+        [
+            *baseline(),
+            completed({"status": "sent"}),
+            completed(
+                {
+                    "cliState": "idle",
+                    "alive": True,
+                    "eventSeq": 3,
+                    "readyForReviewAt": None,
+                    "lastEvent": {"name": "stop", "seq": 3},
+                }
+            ),
+            completed(
+                {
+                    "status": "interrupted",
+                    "reason": "turn-interrupted",
+                    "interrupted": True,
+                }
+            ),
+        ]
+    )
+    cli = client(runner)
+
+    cli.send_input("tab-1", "work")
+    with pytest.raises(WorkerInterrupted, match="interrupted"):
+        cli.wait_for_turn_completion("tab-1", 1)
+
+
 def test_read_result_rejects_stale_result_for_pending_turn() -> None:
     runner = FakeRunner(
         [

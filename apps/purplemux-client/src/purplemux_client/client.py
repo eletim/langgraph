@@ -196,15 +196,11 @@ class PurpleMuxCLIClient:
                 raise WorkerFailure(
                     f"session {session_id} agent became inactive during its turn"
                 )
-            elif state == "ready-for-review" and (
-                saw_busy or self._has_fresh_completion_event(status, baseline)
+            elif state == "ready-for-review" or (
+                state == "idle" and self._has_fresh_completion_event(status, baseline)
             ):
-                result = self._result_data(session_id)
-                if self._accept_fresh_result(session_id, result, baseline):
-                    return
-            elif state == "ready-for-review":
-                # A fresh structured result proves completion if both the short
-                # busy state and its status event were missed by polling.
+                # PurpleMux can return an acknowledged ready-for-review state to
+                # idle while retaining its fresh stop event and structured result.
                 result = self._result_data(session_id)
                 if self._accept_fresh_result(session_id, result, baseline):
                     return
@@ -331,7 +327,16 @@ class PurpleMuxCLIClient:
         self._raise_abnormal_state(session_id, state, status_data)
         event_seq = status_data.get("eventSeq")
         if not isinstance(event_seq, int):
-            event_seq = None
+            last_event = status_data.get("lastEvent")
+            last_event_seq = (
+                last_event.get("seq") if isinstance(last_event, Mapping) else None
+            )
+            event_seq = last_event_seq if isinstance(last_event_seq, int) else None
+        if event_seq is None:
+            raise WorkerFailure(
+                f"session {session_id} status has no event sequence for turn "
+                "correlation"
+            )
         ready_for_review_at = status_data.get("readyForReviewAt")
         if not isinstance(ready_for_review_at, int | float):
             ready_for_review_at = None
