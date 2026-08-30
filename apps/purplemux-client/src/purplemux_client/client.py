@@ -332,6 +332,11 @@ class PurpleMuxCLIClient:
                 last_event.get("seq") if isinstance(last_event, Mapping) else None
             )
             event_seq = last_event_seq if isinstance(last_event_seq, int) else None
+        if event_seq is None:
+            raise WorkerFailure(
+                f"session {session_id} status has no event sequence for turn "
+                "correlation"
+            )
         ready_for_review_at = status_data.get("readyForReviewAt")
         if not isinstance(ready_for_review_at, int | float):
             ready_for_review_at = None
@@ -386,8 +391,10 @@ class PurpleMuxCLIClient:
         if str(last_event.get("name", "")).lower() != "stop":
             return False
         event_seq = last_event.get("seq")
-        return isinstance(event_seq, int) and (
-            baseline.event_seq is None or event_seq > baseline.event_seq
+        return (
+            isinstance(event_seq, int)
+            and baseline.event_seq is not None
+            and event_seq > baseline.event_seq
         )
 
     @staticmethod

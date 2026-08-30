@@ -367,36 +367,18 @@ def test_idle_accepts_fresh_completion_when_busy_poll_is_missed() -> None:
     assert cli.read_result("tab-1") == "fast dismissed"
 
 
-def test_idle_accepts_stop_when_baseline_event_sequence_is_unavailable() -> None:
+def test_send_rejects_unavailable_baseline_event_sequence() -> None:
     runner = FakeRunner(
         [
             completed({"cliState": "idle", "alive": True}),
-            completed({"status": "not-ready", "completionTimestamp": None}),
-            completed({"status": "sent"}),
-            completed(
-                {
-                    "cliState": "idle",
-                    "alive": True,
-                    "eventSeq": 3,
-                    "readyForReviewAt": None,
-                    "lastEvent": {"name": "stop", "seq": 3},
-                }
-            ),
-            completed(
-                {
-                    "status": "completed",
-                    "text": "metadata recovered",
-                    "completionTimestamp": 2,
-                }
-            ),
         ]
     )
     cli = client(runner)
 
-    cli.send_input("tab-1", "work")
-    cli.wait_for_turn_completion("tab-1", 1)
+    with pytest.raises(WorkerFailure, match="no event sequence"):
+        cli.send_input("tab-1", "work")
 
-    assert cli.read_result("tab-1") == "metadata recovered"
+    assert [call[2] for call in runner.calls] == ["status"]
 
 
 def test_idle_rejects_stale_stop_event_and_result() -> None:
