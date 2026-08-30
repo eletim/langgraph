@@ -21,7 +21,7 @@ Python workflow
 The package depends only on the Python standard library. It does not import
 LangGraph.
 
-## Example
+## Python API
 
 ```python
 from purplemux_client import CreateSessionRequest, PurpleMuxCLIClient
@@ -95,3 +95,74 @@ make live-smoke ARGS="lifecycle \
 
 It uses no capture fallback, tmux access, private API, or PurpleMux internal
 file.
+
+## Local Python Runner UI
+
+The package also includes a deliberately small local UI that runs Python code
+and displays its standard output, standard error, and exit code. It is a generic
+Python runner, not a PurpleMux-specific workflow editor: it has no provider
+forms, workspace picker, review loop, graph, persistence, or workflow
+semantics.
+
+Start it from this directory:
+
+```bash
+make web
+```
+
+Equivalently:
+
+```bash
+uv run python -m purplemux_client.web
+```
+
+Then open <http://127.0.0.1:8765>. The host and port can be changed with, for
+example, `make web ARGS="--host 127.0.0.1 --port 9000"`.
+
+The editor can run any Python available in the current environment:
+
+```python
+print("HELLO_RUNNER")
+```
+
+It can also import this package and use the regular Python API:
+
+```python
+from purplemux_client import CreateSessionRequest, PurpleMuxCLIClient
+
+client = PurpleMuxCLIClient("ws-example")
+session_id = client.create_session(
+    CreateSessionRequest(
+        worker="codex",
+        cwd="/workspace/project",
+        command="codex",
+    )
+)
+
+try:
+    client.wait_until_ready(session_id, 60)
+    client.send_input(session_id, "exactly HELLO とだけ返してください")
+    client.wait_for_turn_completion(session_id, 900)
+    print(client.read_result(session_id))
+finally:
+    client.close_session(session_id)
+```
+
+Only one Python process runs at a time. Stop and server shutdown terminate the
+process group started by the runner, including subprocesses created by the
+script. PurpleMux sessions created by user code remain the script's
+responsibility; the runner does not inspect or clean them up.
+
+The polling API consists of `POST /api/run`, `GET /api/status`,
+`GET /api/output`, and `POST /api/stop`. The browser first obtains the
+per-server request token from `GET /api/token`; mutation requests without that
+token or with a foreign browser origin are rejected.
+
+### Security
+
+This is a trusted local development tool that executes arbitrary Python code.
+It binds to `127.0.0.1` by default. It provides no sandbox, authentication, user
+isolation, or remote-execution security and must not be exposed directly to the
+public internet. The Runner UI requires a POSIX operating system so it can
+provide process-group cleanup; this restriction does not apply to the Python
+client API itself.
