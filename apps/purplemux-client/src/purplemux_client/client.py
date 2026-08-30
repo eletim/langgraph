@@ -196,15 +196,11 @@ class PurpleMuxCLIClient:
                 raise WorkerFailure(
                     f"session {session_id} agent became inactive during its turn"
                 )
-            elif state == "ready-for-review" and (
-                saw_busy or self._has_fresh_completion_event(status, baseline)
+            elif state == "ready-for-review" or (
+                state == "idle" and self._has_fresh_completion_event(status, baseline)
             ):
-                result = self._result_data(session_id)
-                if self._accept_fresh_result(session_id, result, baseline):
-                    return
-            elif state == "ready-for-review":
-                # A fresh structured result proves completion if both the short
-                # busy state and its status event were missed by polling.
+                # PurpleMux can return an acknowledged ready-for-review state to
+                # idle while retaining its fresh stop event and structured result.
                 result = self._result_data(session_id)
                 if self._accept_fresh_result(session_id, result, baseline):
                     return
