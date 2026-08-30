@@ -327,7 +327,11 @@ class PurpleMuxCLIClient:
         self._raise_abnormal_state(session_id, state, status_data)
         event_seq = status_data.get("eventSeq")
         if not isinstance(event_seq, int):
-            event_seq = None
+            last_event = status_data.get("lastEvent")
+            last_event_seq = (
+                last_event.get("seq") if isinstance(last_event, Mapping) else None
+            )
+            event_seq = last_event_seq if isinstance(last_event_seq, int) else None
         ready_for_review_at = status_data.get("readyForReviewAt")
         if not isinstance(ready_for_review_at, int | float):
             ready_for_review_at = None
@@ -382,10 +386,8 @@ class PurpleMuxCLIClient:
         if str(last_event.get("name", "")).lower() != "stop":
             return False
         event_seq = last_event.get("seq")
-        return (
-            isinstance(event_seq, int)
-            and baseline.event_seq is not None
-            and event_seq > baseline.event_seq
+        return isinstance(event_seq, int) and (
+            baseline.event_seq is None or event_seq > baseline.event_seq
         )
 
     @staticmethod

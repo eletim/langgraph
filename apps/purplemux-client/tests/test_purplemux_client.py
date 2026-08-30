@@ -367,6 +367,38 @@ def test_idle_accepts_fresh_completion_when_busy_poll_is_missed() -> None:
     assert cli.read_result("tab-1") == "fast dismissed"
 
 
+def test_idle_accepts_stop_when_baseline_event_sequence_is_unavailable() -> None:
+    runner = FakeRunner(
+        [
+            completed({"cliState": "idle", "alive": True}),
+            completed({"status": "not-ready", "completionTimestamp": None}),
+            completed({"status": "sent"}),
+            completed(
+                {
+                    "cliState": "idle",
+                    "alive": True,
+                    "eventSeq": 3,
+                    "readyForReviewAt": None,
+                    "lastEvent": {"name": "stop", "seq": 3},
+                }
+            ),
+            completed(
+                {
+                    "status": "completed",
+                    "text": "metadata recovered",
+                    "completionTimestamp": 2,
+                }
+            ),
+        ]
+    )
+    cli = client(runner)
+
+    cli.send_input("tab-1", "work")
+    cli.wait_for_turn_completion("tab-1", 1)
+
+    assert cli.read_result("tab-1") == "metadata recovered"
+
+
 def test_idle_rejects_stale_stop_event_and_result() -> None:
     runner = FakeRunner(
         [
@@ -382,6 +414,43 @@ def test_idle_rejects_stale_stop_event_and_result() -> None:
                     "cliState": "idle",
                     "alive": True,
                     "eventSeq": 3,
+                    "readyForReviewAt": None,
+                    "lastEvent": {"name": "stop", "seq": 3},
+                }
+            ),
+        ]
+    )
+    cli = client(runner)
+
+    cli.send_input("tab-1", "work")
+    with pytest.raises(WorkerFailure, match="did not complete"):
+        cli.wait_for_turn_completion("tab-1", 0)
+
+    assert [call[2] for call in runner.calls] == ["status", "result", "send", "status"]
+
+
+def test_idle_uses_baseline_last_event_sequence_to_reject_stale_stop() -> None:
+    runner = FakeRunner(
+        [
+            completed(
+                {
+                    "cliState": "idle",
+                    "alive": True,
+                    "lastEvent": {"name": "stop", "seq": 3},
+                }
+            ),
+            completed(
+                {
+                    "status": "completed",
+                    "text": "old",
+                    "completionTimestamp": 10,
+                }
+            ),
+            completed({"status": "sent"}),
+            completed(
+                {
+                    "cliState": "idle",
+                    "alive": True,
                     "readyForReviewAt": None,
                     "lastEvent": {"name": "stop", "seq": 3},
                 }
