@@ -4,18 +4,51 @@ import json
 import subprocess
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol, cast
 
-from coding_orchestrator.client import (
-    CreateSessionRequest,
-    MutationOutcomeUnknown,
-    ResultNotReady,
-    SessionReadyTimeout,
-    WorkerFailure,
-    WorkerInterrupted,
-    WorkerNeedsInput,
-)
+
+class TerminalSessionError(RuntimeError):
+    """Base error for PurpleMux terminal session operations."""
+
+
+class SessionReadyTimeout(TerminalSessionError):
+    """Raised when a PurpleMux session does not become ready in time."""
+
+
+class WorkerFailure(TerminalSessionError):
+    """Raised when a PurpleMux-backed worker or CLI operation fails."""
+
+
+class WorkerNeedsInput(WorkerFailure):
+    """Raised when a worker cannot complete without additional input."""
+
+
+class WorkerInterrupted(WorkerFailure):
+    """Raised when a worker turn is interrupted."""
+
+
+class ResultNotReady(WorkerFailure):
+    """Raised when a fresh structured worker result is not ready."""
+
+
+class MutationOutcomeUnknown(WorkerFailure):
+    """Raised when a timed-out mutation may have been applied remotely."""
+
+
+@dataclass(frozen=True)
+class CreateSessionRequest:
+    """Describe the provider session to create in a PurpleMux workspace.
+
+    PurpleMux owns provider launch commands and the workspace directory. `worker`
+    selects the provider; `cwd`, `command`, and `metadata` describe caller intent and
+    are retained for generated-workflow APIs.
+    """
+
+    worker: str
+    cwd: str
+    command: str
+    metadata: Mapping[str, str] = field(default_factory=dict)
 
 
 class SubprocessRunner(Protocol):
@@ -52,10 +85,11 @@ class _TurnBaseline:
     completion_timestamp: int | float | None
     event_seq: int | None
     ready_for_review_at: int | float | None
+    interrupted: bool
 
 
 class PurpleMuxCLIClient:
-    """Production terminal client backed only by PurpleMux CLI contracts."""
+    """Thin Python adapter over the public PurpleMux CLI."""
 
     def __init__(
         self,
@@ -89,6 +123,7 @@ class PurpleMuxCLIClient:
         self._completed_turns: dict[str, dict[str, Any]] = {}
 
     def create_session(self, request: CreateSessionRequest) -> str:
+        """Create and launch a Codex or Claude session."""
         panel_type = _PANEL_TYPES.get(request.worker.lower())
         if panel_type is None:
             panel_type = _PANEL_TYPES.get(request.command.lower())
@@ -107,7 +142,12 @@ class PurpleMuxCLIClient:
             raise WorkerFailure("PurpleMux create did not return a tab ID")
         return session_id
 
+    def read_status(self, session_id: str) -> dict[str, Any]:
+        """Read authoritative agent state from PurpleMux StatusManager output."""
+        return self._status(session_id)
+
     def wait_until_ready(self, session_id: str, timeout_seconds: float) -> None:
+        """Wait until the agent can accept input."""
         deadline = self._monotonic() + timeout_seconds
         while True:
             status = self._status(session_id)
@@ -123,6 +163,7 @@ class PurpleMuxCLIClient:
             self._sleep(self.poll_interval_seconds)
 
     def send_input(self, session_id: str, text: str) -> None:
+        """Submit one prompt after recording a correlation baseline."""
         if not text:
             raise ValueError("text must not be empty")
         baseline = self._read_turn_baseline(session_id)
@@ -134,53 +175,8 @@ class PurpleMuxCLIClient:
         self._turn_baselines[session_id] = baseline
         self._completed_turns.pop(session_id, None)
 
-    def read_status(self, session_id: str) -> dict[str, Any]:
-        """Read PurpleMux runtime status without deriving state from tmux details."""
-        return self._status(session_id)
-
-    def wait_for_turn_state_completion(
-        self, session_id: str, timeout_seconds: float
-    ) -> None:
-        """Wait for a fresh ready-for-review state without reading agent output.
-
-        This supports lifecycle diagnostics while structured result is unavailable;
-        it does not satisfy `TerminalSessionClient.wait_for_turn_completion`.
-        """
-        self._wait_for_turn(session_id, timeout_seconds, require_result=False)
-
-    def wait_until_turn_busy(self, session_id: str, timeout_seconds: float) -> None:
-        """Wait until PurpleMux reports that the pending turn is busy."""
-        baseline = self._turn_baselines.get(session_id)
-        if baseline is None:
-            raise WorkerFailure(f"session {session_id} has no pending input")
-        deadline = self._monotonic() + timeout_seconds
-        last_state = "unknown"
-        while True:
-            status = self._status(session_id)
-            state = self._state(status, session_id)
-            last_state = state
-            self._raise_abnormal_state(session_id, state, status)
-            if self._is_fresh_interrupt(status, baseline):
-                raise WorkerInterrupted(f"session {session_id} turn was interrupted")
-            if state == "busy":
-                return
-            if self._monotonic() >= deadline:
-                raise WorkerFailure(
-                    f"session {session_id} did not become busy within "
-                    f"{timeout_seconds}s (last cliState={last_state})"
-                )
-            self._sleep(self.poll_interval_seconds)
-
     def wait_for_turn_completion(self, session_id: str, timeout_seconds: float) -> None:
-        self._wait_for_turn(session_id, timeout_seconds, require_result=True)
-
-    def _wait_for_turn(
-        self,
-        session_id: str,
-        timeout_seconds: float,
-        *,
-        require_result: bool,
-    ) -> None:
+        """Wait for a fresh completed turn and its structured result."""
         deadline = self._monotonic() + timeout_seconds
         baseline = self._turn_baselines.get(session_id)
         if baseline is None:
@@ -203,48 +199,18 @@ class PurpleMuxCLIClient:
             elif state == "ready-for-review" and (
                 saw_busy or self._has_fresh_completion_event(status, baseline)
             ):
-                if not require_result:
-                    return
-                # State and provider transcript updates can become visible a few
-                # polls apart. Wait for the structured result as well, so the
-                # workflow's immediate read_result call cannot race transcript
-                # discovery. This also distinguishes busy -> idle interrupts.
                 result = self._result_data(session_id)
-                result_status = self._result_status(result, session_id)
-                if result_status == "interrupted" or result.get("interrupted") is True:
-                    raise WorkerInterrupted(
-                        f"session {session_id} turn was interrupted"
-                    )
-                if result_status == "completed" and self._is_fresh_result(
-                    result, baseline
-                ):
-                    self._completed_turns[session_id] = result
-                    self._turn_baselines.pop(session_id, None)
+                if self._accept_fresh_result(session_id, result, baseline):
                     return
-                if result_status in {"not-applicable", "unavailable"}:
-                    reason = result.get("reason")
-                    raise WorkerFailure(
-                        f"session {session_id} result is {result_status}: {reason}"
-                    )
-            elif state == "ready-for-review" and require_result:
-                # A fresh structured result also proves completion if a short busy
-                # transition and its status event were both missed by polling.
+            elif state == "ready-for-review":
+                # A fresh structured result proves completion if both the short
+                # busy state and its status event were missed by polling.
                 result = self._result_data(session_id)
-                result_status = self._result_status(result, session_id)
-                if result_status == "interrupted" or result.get("interrupted") is True:
-                    raise WorkerInterrupted(
-                        f"session {session_id} turn was interrupted"
-                    )
-                if result_status == "completed" and self._is_fresh_result(
-                    result, baseline
-                ):
-                    self._completed_turns[session_id] = result
-                    self._turn_baselines.pop(session_id, None)
+                if self._accept_fresh_result(session_id, result, baseline):
                     return
-            elif state == "idle" and saw_busy and require_result:
+            elif state == "idle" and saw_busy:
                 result = self._result_data(session_id)
-                result_status = self._result_status(result, session_id)
-                if result_status == "interrupted" or result.get("interrupted") is True:
+                if self._result_is_interrupted(result):
                     raise WorkerInterrupted(
                         f"session {session_id} turn was interrupted"
                     )
@@ -257,17 +223,28 @@ class PurpleMuxCLIClient:
             self._sleep(self.poll_interval_seconds)
 
     def read_result(self, session_id: str) -> str:
+        """Read the latest structured result, rejecting stale pending-turn data."""
         data = self._completed_turns.pop(session_id, None)
         if data is None:
             data = self._result_data(session_id)
         status = self._result_status(data, session_id)
         reason = data.get("reason")
         detail = f": {reason}" if isinstance(reason, str) and reason else ""
-        if status == "interrupted" or data.get("interrupted") is True:
+        baseline = self._turn_baselines.get(session_id)
+        if self._result_is_interrupted(data):
+            if baseline is not None and baseline.interrupted:
+                raise ResultNotReady(
+                    f"session {session_id} interrupt result is stale for the "
+                    "pending turn"
+                )
             raise WorkerInterrupted(
                 f"session {session_id} turn was interrupted{detail}"
             )
         if status == "completed":
+            if baseline is not None and not self._is_fresh_result(data, baseline):
+                raise ResultNotReady(
+                    f"session {session_id} result is stale for the pending turn"
+                )
             text = data.get("text")
             if not isinstance(text, str):
                 raise WorkerFailure(
@@ -279,6 +256,7 @@ class PurpleMuxCLIClient:
         raise WorkerFailure(f"session {session_id} result is {status}{detail}")
 
     def interrupt(self, session_id: str) -> None:
+        """Request interruption of the foreground agent turn."""
         self._run_json(
             ["tab", "interrupt", "-w", self.workspace_id, session_id],
             operation="interrupt",
@@ -286,6 +264,7 @@ class PurpleMuxCLIClient:
         )
 
     def close_session(self, session_id: str) -> None:
+        """Close the tab and discard local correlation state."""
         self._run(
             ["tab", "close", "-w", self.workspace_id, session_id],
             operation="close",
@@ -295,7 +274,7 @@ class PurpleMuxCLIClient:
         self._completed_turns.pop(session_id, None)
 
     def capture_screen(self, session_id: str) -> str:
-        """Capture diagnostic pane text; this is never used as an agent result."""
+        """Capture diagnostic pane text; never use this as an agent result."""
         data = self._run_json(
             ["tab", "capture", "-w", self.workspace_id, session_id],
             operation="capture",
@@ -305,6 +284,32 @@ class PurpleMuxCLIClient:
         if not isinstance(content, str):
             raise WorkerFailure("PurpleMux capture did not return text content")
         return content
+
+    def _accept_fresh_result(
+        self,
+        session_id: str,
+        result: dict[str, Any],
+        baseline: _TurnBaseline,
+    ) -> bool:
+        result_status = self._result_status(result, session_id)
+        if self._result_is_interrupted(result):
+            if baseline.interrupted:
+                return False
+            raise WorkerInterrupted(f"session {session_id} turn was interrupted")
+        if result_status == "completed" and self._is_fresh_result(result, baseline):
+            self._completed_turns[session_id] = result
+            self._turn_baselines.pop(session_id, None)
+            return True
+        if result_status in {"not-applicable", "unavailable"}:
+            reason = result.get("reason")
+            raise WorkerFailure(
+                f"session {session_id} result is {result_status}: {reason}"
+            )
+        return False
+
+    @staticmethod
+    def _result_is_interrupted(data: Mapping[str, Any]) -> bool:
+        return data.get("status") == "interrupted" or data.get("interrupted") is True
 
     def _status(self, session_id: str) -> dict[str, Any]:
         return self._run_json(
@@ -338,17 +343,26 @@ class PurpleMuxCLIClient:
                 raise WorkerFailure(
                     f"session {session_id} completed result has no completionTimestamp"
                 )
-            return _TurnBaseline(timestamp, event_seq, ready_for_review_at)
+            return _TurnBaseline(
+                timestamp,
+                event_seq,
+                ready_for_review_at,
+                self._result_is_interrupted(data),
+            )
         if status in {"not-ready", "interrupted"}:
-            return _TurnBaseline(None, event_seq, ready_for_review_at)
+            return _TurnBaseline(
+                None,
+                event_seq,
+                ready_for_review_at,
+                self._result_is_interrupted(data),
+            )
         reason = data.get("reason")
         raise WorkerFailure(
             f"session {session_id} cannot start a correlated turn: {status}: {reason}"
         )
 
-    def _is_fresh_result(
-        self, data: Mapping[str, Any], baseline: _TurnBaseline
-    ) -> bool:
+    @staticmethod
+    def _is_fresh_result(data: Mapping[str, Any], baseline: _TurnBaseline) -> bool:
         timestamp = data.get("completionTimestamp")
         if not isinstance(timestamp, int | float):
             raise WorkerFailure("PurpleMux completed result has no completionTimestamp")
@@ -356,8 +370,9 @@ class PurpleMuxCLIClient:
             return True
         return timestamp > baseline.completion_timestamp
 
+    @staticmethod
     def _has_fresh_completion_event(
-        self, data: Mapping[str, Any], baseline: _TurnBaseline
+        data: Mapping[str, Any], baseline: _TurnBaseline
     ) -> bool:
         ready_for_review_at = data.get("readyForReviewAt")
         if isinstance(ready_for_review_at, int | float) and (
@@ -377,9 +392,8 @@ class PurpleMuxCLIClient:
             and event_seq > baseline.event_seq
         )
 
-    def _is_fresh_interrupt(
-        self, data: Mapping[str, Any], baseline: _TurnBaseline
-    ) -> bool:
+    @staticmethod
+    def _is_fresh_interrupt(data: Mapping[str, Any], baseline: _TurnBaseline) -> bool:
         last_event = data.get("lastEvent")
         if not isinstance(last_event, Mapping):
             return False
@@ -392,13 +406,15 @@ class PurpleMuxCLIClient:
             and event_seq > baseline.event_seq
         )
 
-    def _state(self, data: Mapping[str, Any], session_id: str) -> str:
+    @staticmethod
+    def _state(data: Mapping[str, Any], session_id: str) -> str:
         state = data.get("cliState")
         if not isinstance(state, str) or not state:
             raise WorkerFailure(f"PurpleMux status for {session_id} has no cliState")
         return state.lower()
 
-    def _result_status(self, data: Mapping[str, Any], session_id: str) -> str:
+    @staticmethod
+    def _result_status(data: Mapping[str, Any], session_id: str) -> str:
         status = data.get("status")
         if not isinstance(status, str) or status not in _RESULT_STATUSES:
             raise WorkerFailure(
@@ -406,8 +422,9 @@ class PurpleMuxCLIClient:
             )
         return status
 
+    @staticmethod
     def _raise_abnormal_state(
-        self, session_id: str, state: str, data: Mapping[str, Any]
+        session_id: str, state: str, data: Mapping[str, Any]
     ) -> None:
         if state == "needs-input":
             raise WorkerNeedsInput(f"session {session_id} needs input")
@@ -450,9 +467,6 @@ class PurpleMuxCLIClient:
                         f"PurpleMux {operation} timed out after "
                         f"{self.command_timeout_seconds}s"
                     ) from exc
-                # A mutation may have reached PurpleMux before the local process
-                # timed out. Blind retry could duplicate create/send. Callers must
-                # reconcile via status/result (and tab list for create/close).
                 raise MutationOutcomeUnknown(
                     f"PurpleMux {operation} timed out after "
                     f"{self.command_timeout_seconds}s; remote outcome is unknown"
